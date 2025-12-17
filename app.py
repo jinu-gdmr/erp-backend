@@ -1,5 +1,5 @@
 # backend/app.py
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import base64, os
 from dotenv import load_dotenv
@@ -9,11 +9,12 @@ import jwt
 from functools import wraps
 from utils import send_email, generate_random_password
 from bson import ObjectId
-from datetime import datetime, timedelta, timezone, time  # Added 'time'
-from flask import send_from_directory
+from datetime import datetime, timedelta, timezone, time
 import pytz
 from flask_bcrypt import Bcrypt
 import threading
+import cloudinary
+import cloudinary.uploader
 
 load_dotenv()
 
@@ -44,6 +45,14 @@ users_col = db["users"]
 attendance_col = db["attendance"]
 leaves_col = db["leaves"]
 
+# --- CLOUDINARY CONFIGURATION ---
+cloudinary.config(
+    cloud_name = os.getenv('CLOUDINARY_CLOUD_NAME'),
+    api_key = os.getenv('CLOUDINARY_API_KEY'),
+    api_secret = os.getenv('CLOUDINARY_API_SECRET'),
+    secure = True
+)
+
 UPLOAD_FOLDER = "uploads/attendance_photos"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -70,8 +79,8 @@ def home():
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
-        uploads_dir = os.path.join(os.getcwd(), "uploads")
-        return send_from_directory(uploads_dir, filename)
+    uploads_dir = os.path.join(os.getcwd(), "uploads")
+    return send_from_directory(uploads_dir, filename)
 
 # -------------------------------------------------------------
 # AUTH MIDDLEWARE
@@ -98,9 +107,8 @@ def token_required(f):
         return f(*args, **kwargs)
     return decorated
 
-
 # -------------------------------------------------------------
-# FORGOT PASSWORD (NEW)
+# FORGOT PASSWORD
 # -------------------------------------------------------------
 @app.route("/api/forgot-password", methods=["POST"])
 def forgot_password():
@@ -109,17 +117,13 @@ def forgot_password():
 
     user = users_col.find_one({"email": email})
     if not user:
-        # Return success even if user not found for security
         return jsonify({"message": "If this email exists, a password reset has been sent."}), 200
 
-    # Generate temporary password
     temp_password = generate_random_password()
     hashed = bcrypt.generate_password_hash(temp_password).decode("utf-8")
     
-    # Update user password
     users_col.update_one({"_id": user["_id"]}, {"$set": {"password": hashed}})
 
-    # Send Email
     subject = "Password Reset Request"
     body = (
         f"Hello {user['name']},\n\n"
@@ -131,7 +135,6 @@ def forgot_password():
     threading.Thread(target=send_email, args=(email, subject, body), daemon=True).start()
 
     return jsonify({"message": "Password reset email sent."}), 200
-
 
 # -------------------------------------------------------------
 # ADMIN REGISTER
@@ -159,7 +162,6 @@ def register_admin():
     }
     res = users_col.insert_one(user_doc)
     return jsonify({"message": "Admin created", "id": str(res.inserted_id)}), 201
-
 
 # -------------------------------------------------------------
 # MANAGER REGISTER
@@ -199,7 +201,6 @@ def register_manager():
     users_col.insert_one(new_user)
     return jsonify({"message": "Manager created successfully!"}), 201
 
-
 # -------------------------------------------------------------
 # LOGIN
 # -------------------------------------------------------------
@@ -226,7 +227,6 @@ def login():
             "email": user.get("email")
         }
     })
-
 
 # -------------------------------------------------------------
 # ADMIN: ADD EMPLOYEE
@@ -281,7 +281,6 @@ def add_employee():
 
     return jsonify({"message": "Employee created", "id": str(res.inserted_id)}), 201
 
-
 # -------------------------------------------------------------
 # ADMIN: LIST EMPLOYEES
 # -------------------------------------------------------------
@@ -306,7 +305,6 @@ def list_employees():
 
     return jsonify(rows)
 
-
 # -------------------------------------------------------------
 # ADMIN: LIST MANAGERS
 # -------------------------------------------------------------
@@ -324,7 +322,6 @@ def list_managers():
         managers.append(m)
 
     return jsonify(managers)
-
 
 # -------------------------------------------------------------
 # EDIT EMPLOYEE
@@ -350,7 +347,6 @@ def edit_employee(emp_id):
     
     return jsonify({"message": "Updated"})
 
-
 # -------------------------------------------------------------
 # DELETE EMPLOYEE
 # -------------------------------------------------------------
@@ -366,9 +362,8 @@ def delete_employee(emp_id):
 
     return jsonify({"message": "Deleted"})
 
-
 # -------------------------------------------------------------
-# CHECK-IN WITH PHOTO (UPDATED TIME LIMITS)
+# CHECK-IN WITH PHOTO (UPDATED FOR CLOUDINARY)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkin-photo", methods=["POST"])
 @token_required
@@ -378,42 +373,30 @@ def checkin_photo():
 
     uid = str(request.user["_id"])
     now_ist = datetime.now(IST)
-    current_time = now_ist.time() # Extract time
+    current_time = now_ist.time()
     today = now_ist.date()
 
-    # Define Check-in Windows
     MORNING_OPEN = time(9, 0)
     MORNING_CLOSE = time(10, 15)
-    
     AFTERNOON_OPEN = time(13, 0)
     AFTERNOON_CLOSE = time(14, 0)
     
-    # Check if already checked in
     if attendance_col.find_one({"user_id": uid, "type": "checkin", "date": str(today)}):
         return jsonify({"message": "Already checked in!"}), 400
 
-    # Logic for Check-in Windows
     checkin_type = "full"
     status_indicator = "On Time"
 
     if MORNING_OPEN <= current_time <= MORNING_CLOSE:
         checkin_type = "full"
-        # Optional: Add Late logic here if needed (e.g. after 9:30)
-        # if current_time > time(9, 30): status_indicator = "Late"
-
-        # REVISION 1: Late checkin limit logic (only if marking late)
-        # ... existing revision limit logic if required ...
-
     elif AFTERNOON_OPEN <= current_time <= AFTERNOON_CLOSE:
         checkin_type = "half-day"
         status_indicator = "On Time"
-        
     else:
         return jsonify({
             "message": f"Check-in not allowed. Morning: {MORNING_OPEN.strftime('%I:%M %p')}-{MORNING_CLOSE.strftime('%I:%M %p')}, Afternoon: {AFTERNOON_OPEN.strftime('%I:%M %p')}-{AFTERNOON_CLOSE.strftime('%I:%M %p')}"
         }), 400
 
-    # Process Image
     data = request.get_json()
     img_data = data.get("image")
     if not img_data:
@@ -422,10 +405,18 @@ def checkin_photo():
     header, encoded = img_data.split(",", 1)
     image_bytes = base64.b64decode(encoded)
 
-    filename = f"{uid}_checkin_{int(datetime.now(timezone.utc).timestamp())}.jpg"
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    with open(path, "wb") as f:
-        f.write(image_bytes)
+    # --- CLOUDINARY UPLOAD ---
+    try:
+        upload_result = cloudinary.uploader.upload(
+            image_bytes, 
+            folder="attendance_photos",
+            public_id=f"{uid}_checkin_{int(datetime.now(timezone.utc).timestamp())}",
+            resource_type="image"
+        )
+        photo_url = upload_result.get("secure_url")
+    except Exception as e:
+        print("Cloudinary Upload Error:", e)
+        return jsonify({"message": "Image upload failed"}), 500
 
     attendance_col.insert_one({
         "user_id": uid,
@@ -433,15 +424,14 @@ def checkin_photo():
         "date": str(today),
         "day_type": checkin_type,
         "time": datetime.now(timezone.utc),
-        "photo_url": f"/attendance_photos/{filename}",
+        "photo_url": photo_url,
         "status_indicator": status_indicator 
     })
 
     return jsonify({"message": f"Checked in ({checkin_type})"}), 200
 
-
 # -------------------------------------------------------------
-# CHECK-OUT PHOTO (UPDATED TIME LIMITS)
+# CHECK-OUT PHOTO (UPDATED FOR CLOUDINARY)
 # -------------------------------------------------------------
 @app.route("/api/attendance/checkout-photo", methods=["POST"])
 @token_required
@@ -461,25 +451,19 @@ def checkout_photo():
     if attendance_col.find_one({"user_id": uid, "type": "checkout", "date": str(today)}):
         return jsonify({"message": "Already checked out!"}), 400
 
-    # Define Checkout Windows
     HALF_DAY_LOGOUT_OPEN = time(13, 0)
     HALF_DAY_LOGOUT_CLOSE = time(14, 0)
-    
     FULL_DAY_LOGOUT_OPEN = time(18, 0)
     FULL_DAY_LOGOUT_CLOSE = time(19, 30)
 
     final_day_type = checkin.get("day_type", "full")
     status_indicator = "On Time"
 
-    # Check Windows
     if HALF_DAY_LOGOUT_OPEN <= current_time <= HALF_DAY_LOGOUT_CLOSE:
         final_day_type = "half-day"
-        # Update checkin to half-day if user logs out early
         attendance_col.update_one({"_id": checkin["_id"]}, {"$set": {"day_type": "half-day"}})
-        
     elif FULL_DAY_LOGOUT_OPEN <= current_time <= FULL_DAY_LOGOUT_CLOSE:
-        pass # full day, no change
-        
+        pass 
     else:
          return jsonify({
             "message": f"Checkout not allowed. Half-Day: {HALF_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{HALF_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}, Full-Day: {FULL_DAY_LOGOUT_OPEN.strftime('%I:%M %p')}-{FULL_DAY_LOGOUT_CLOSE.strftime('%I:%M %p')}"
@@ -491,28 +475,34 @@ def checkout_photo():
     header, encoded = img_data.split(",", 1)
     image_bytes = base64.b64decode(encoded)
 
-    filename = f"{uid}_checkout_{int(datetime.now(timezone.utc).timestamp())}.jpg"
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    with open(path, "wb") as f:
-        f.write(image_bytes)
+    # --- CLOUDINARY UPLOAD ---
+    try:
+        upload_result = cloudinary.uploader.upload(
+            image_bytes, 
+            folder="attendance_photos",
+            public_id=f"{uid}_checkout_{int(datetime.now(timezone.utc).timestamp())}",
+            resource_type="image"
+        )
+        photo_url = upload_result.get("secure_url")
+    except Exception as e:
+        print("Cloudinary Upload Error:", e)
+        return jsonify({"message": "Image upload failed"}), 500
 
     attendance_col.insert_one({
         "user_id": uid,
         "type": "checkout",
         "date": str(today),
         "time": datetime.now(timezone.utc),
-        "photo_url": f"/attendance_photos/{filename}",
+        "photo_url": photo_url,
         "day_type": final_day_type,
         "status_indicator": status_indicator
     })
 
     return jsonify({"message": f"Checked out ({final_day_type})"}), 200
 
-
 @app.route("/attendance_photos/<path:filename>")
 def serve_attendance_photo(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
-
 
 # -------------------------------------------------------------
 # APPLY LEAVE
@@ -530,7 +520,6 @@ def apply_leave():
     if not date_str:
         return jsonify({"message": "Date required"}), 400
 
-    # Revision 2: 7-day limit
     try:
         leave_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
@@ -569,7 +558,6 @@ def apply_leave():
     res = leaves_col.insert_one(leave)
     return jsonify({"message": "Applied", "id": str(res.inserted_id)}), 201
 
-
 # -------------------------------------------------------------
 # ADMIN VIEW LEAVES
 # -------------------------------------------------------------
@@ -597,7 +585,6 @@ def admin_view_leaves():
         rows.append(l)
 
     return jsonify(rows), 200
-
 
 # -------------------------------------------------------------
 # UPDATE LEAVE STATUS
@@ -654,7 +641,6 @@ def update_leave(leave_id):
 
     return jsonify({"message": "Updated"})
 
-
 # -------------------------------------------------------------
 # MANAGER: LIST MY EMPLOYEES
 # -------------------------------------------------------------
@@ -673,7 +659,6 @@ def manager_my_employees():
 
     return jsonify(rows)
 
-
 # -------------------------------------------------------------
 # MY ATTENDANCE
 # -------------------------------------------------------------
@@ -690,7 +675,6 @@ def my_attendance():
 
     return jsonify(rows)
 
-
 # -------------------------------------------------------------
 # MY LEAVES
 # -------------------------------------------------------------
@@ -705,7 +689,6 @@ def my_leaves():
         rows.append(l)
 
     return jsonify(rows)
-
 
 # -------------------------------------------------------------
 # ADMIN: EMPLOYEE ATTENDANCE
@@ -730,7 +713,6 @@ def admin_employee_attendance(emp_id):
 
     return jsonify(records)
 
-
 # -------------------------------------------------------------
 # AUTO ABSENT
 # -------------------------------------------------------------
@@ -752,7 +734,6 @@ def auto_mark_absent():
             })
 
     return jsonify({"message": "Absent auto-marking completed"}), 200
-
 
 # -------------------------------------------------------------
 # ADMIN MONTHLY SUMMARY
@@ -801,7 +782,6 @@ def attendance_summary():
 
     return jsonify(summary), 200
 
-
 # -------------------------------------------------------------
 # TODAY STATS
 # -------------------------------------------------------------
@@ -831,7 +811,6 @@ def today_stats():
         "present": len(present), "absent": len(absent),
         "leave": len(leaves_today), "not_checked_in": len(not_checked_in),
     }), 200
-
 
 # -------------------------------------------------------------
 # RUN SERVER
