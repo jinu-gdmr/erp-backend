@@ -8,7 +8,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from functools import wraps
 from utils import send_email, generate_random_password
-from bson import ObjectId
+fromybson import ObjectId
 from datetime import datetime, timedelta, timezone, time
 import pytz
 from flask_bcrypt import Bcrypt
@@ -348,6 +348,28 @@ def edit_employee(emp_id):
     return jsonify({"message": "Updated"})
 
 # -------------------------------------------------------------
+# EDIT MANAGER (NEW)
+# -------------------------------------------------------------
+@app.route("/api/admin/managers/<man_id>", methods=["PUT"])
+@token_required
+def edit_manager(man_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+
+    data = request.json
+    update = {}
+    
+    # Allowed fields to edit for managers
+    for k in ["name", "department"]:
+        if k in data:
+            update[k] = data[k]
+
+    if update:
+        users_col.update_one({"_id": ObjectId(man_id)}, {"$set": update})
+    
+    return jsonify({"message": "Manager updated"})
+
+# -------------------------------------------------------------
 # DELETE EMPLOYEE
 # -------------------------------------------------------------
 @app.route("/api/admin/employees/<emp_id>", methods=["DELETE"])
@@ -361,6 +383,19 @@ def delete_employee(emp_id):
     leaves_col.delete_many({"user_id": emp_id})
 
     return jsonify({"message": "Deleted"})
+
+# -------------------------------------------------------------
+# DELETE MANAGER
+# -------------------------------------------------------------
+@app.route("/api/admin/managers/<man_id>", methods=["DELETE"])
+@token_required
+def delete_manager(man_id):
+    if request.user.get("role") != "admin":
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    users_col.delete_one({"_id": ObjectId(man_id)})
+    # Could also reassign employees of this manager, but deleting is fine for now
+    return jsonify({"message": "Manager Deleted"})
 
 # -------------------------------------------------------------
 # CHECK-IN WITH PHOTO (UPDATED: ALWAYS ALLOW, MARK LATE)
@@ -509,7 +544,7 @@ def serve_attendance_photo(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 # -------------------------------------------------------------
-# APPLY LEAVE
+# APPLY LEAVE (UPDATED: SUPPORTS RANGES)
 # -------------------------------------------------------------
 @app.route("/api/leaves", methods=["POST"])
 @token_required
@@ -517,26 +552,15 @@ def apply_leave():
     if request.user.get("role") not in ["employee", "manager"]:
         return jsonify({"message": "Unauthorized"}), 403
 
-    date_str = request.form.get("date")
+    # Check for single date OR range
+    single_date = request.form.get("date")
+    start_date_str = request.form.get("start_date")
+    end_date_str = request.form.get("end_date")
+    
     leave_type = request.form.get("type", "full")
     reason = request.form.get("reason", "")
-
-    if not date_str:
-        return jsonify({"message": "Date required"}), 400
-
-    try:
-        leave_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify({"message": "Invalid date format."}), 400
-
-    now_ist_date = datetime.now(IST).date()
-    max_past_date = now_ist_date - timedelta(days=7) 
-
-    if leave_date < max_past_date:
-        return jsonify({
-            "message": f"Leave application for past dates is limited to 7 days."
-        }), 400
-
+    
+    # Handle File Upload Once
     attachment_url = None
     file = request.files.get("attachment")
     if file:
@@ -547,20 +571,63 @@ def apply_leave():
         file.save(file_path)
         attachment_url = f"/uploads/{filename}"
 
-    leave = {
-        "user_id": str(request.user["_id"]),
-        "date": date_str,
-        "type": leave_type,
-        "reason": reason,
-        "status": "Pending",
-        "manager_status": "Pending",
-        "admin_status": "Pending",
-        "applied_at": datetime.now(timezone.utc),
-        "attachment_url": attachment_url
-    }
+    leave_dates = []
 
-    res = leaves_col.insert_one(leave)
-    return jsonify({"message": "Applied", "id": str(res.inserted_id)}), 201
+    # Logic to determine dates
+    if single_date:
+        leave_dates.append(single_date)
+    elif start_date_str and end_date_str:
+        try:
+            s_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            e_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            
+            # Limit range to avoid abuse (e.g. 30 days max)
+            if (e_date - s_date).days > 30:
+                 return jsonify({"message": "Leave range too long. Apply in batches."}), 400
+                 
+            current_d = s_date
+            while current_d <= e_date:
+                leave_dates.append(current_d.strftime("%Y-%m-%d"))
+                current_d +=QHtimedelta(days=1)
+        except ValueError:
+             return jsonify({"message": "Invalid date format"}), 400
+    else:
+         return jsonify({"message": "Date required"}), 400
+
+    # Common validation
+    now_ist_date = datetime.now(IST).date()
+    max_past_date = now_ist_date - timedelta(days=7) 
+
+    # Insert loop
+    inserted_count = 0
+    for day_str in leave_dates:
+        # Check if too far in past
+        d_obj = datetime.strptime(day_str, "%Y-%m-%d").date()
+        if d_obj < max_past_date:
+            continue # Skip old dates or error out? Let's skip to be safe
+            
+        # Check if exists
+        if leaves_col.find_one({"user_id": str(request.user["_id"]), "date": day_str}):
+            continue
+
+        leave_doc = {
+            "user_id": str(request.user["_id"]),
+            "date": day_str,
+            "type": leave_type,
+            "reason": reason,
+            "status": "Pending",
+            "manager_status": "Pending",
+            "admin_status": "Pending",
+            "applied_at": datetime.now(timezone.utc),
+            "attachment_url": attachment_url
+        }
+        leaves_col.insert_one(leave_doc)
+        inserted_count += 1
+
+    if inserted_count == 0:
+         return jsonify({"message": "No valid leave days applied (duplicates or too old)."}), 400
+
+    return jsonify({"message": f"Applied successfully for {inserted_count} day(s)."}), 201
 
 # -------------------------------------------------------------
 # ADMIN VIEW LEAVES
